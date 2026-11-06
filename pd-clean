@@ -2,7 +2,6 @@
 
 clear
 
-echo "© 2026 fb.com/thuong.hai.581."
 echo "All rights reserved."
 
 if [ "$EUID" -eq 0 ]; then
