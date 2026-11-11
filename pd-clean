@@ -33,23 +33,20 @@ for u in ("https://1.1.1.1", "https://www.apple.com", "https://www.google.com"):
 ' 2>/dev/null
 }
 
-# Hàm khôi phục giờ (hoạt động cả Online lẫn Offline)
+# Hàm khôi phục giờ cho macOS (hoạt động cả Online lẫn Offline)
 restore_time() {
   local target_ts=""
 
-  # Ưu tiên 1: Lấy từ mốc SAVED_EPOCH đã lưu trước khi lùi giờ + số giây script đã chạy (Offline 100%)
   if (( SAVED_EPOCH > 0 )); then
     target_ts=$(( SAVED_EPOCH + SECONDS ))
   fi
 
-  # Ưu tiên 2: Nếu có mạng, lấy giờ chuẩn từ Internet để chính xác tuyệt đối
   local net_ts
   net_ts=$(fetch_network_epoch)
   if [[ -n "$net_ts" ]]; then
     target_ts="$net_ts"
   fi
 
-  # Ưu tiên 3: Nếu SAVED_EPOCH chưa có và đang Offline, đọc từ file cache lần chạy trước
   if [[ -z "$target_ts" && -f "$EPOCH_CACHE" ]]; then
     local cached_ts
     cached_ts=$(cat "$EPOCH_CACHE" 2>/dev/null)
@@ -58,24 +55,22 @@ restore_time() {
     fi
   fi
 
-  # Áp dụng thời gian đã tính toán vào hệ thống macOS
   if [[ -n "$target_ts" && "$target_ts" -gt 0 ]]; then
     date "$(date -r "$target_ts" "+%m%d%H%M%Y.%S")" >/dev/null 2>&1
     echo "$target_ts" > "$EPOCH_CACHE"
   fi
 
-  # Bật lại dịch vụ tự động đồng bộ giờ của macOS
   systemsetup -setusingnetworktime on >/dev/null 2>&1
   killall -9 timed 2>/dev/null
   launchctl kickstart -k system/com.apple.timed 2>/dev/null
   rm -rf /var/db/sudo/ts/* 2>/dev/null
 
-  echo "System time restored: $(date)"
+  echo "macOS time restored: $(date)"
 }
 
 trap 'echo ""; restore_time; exit 0' INT TERM
 
-# 2. Đọc hoặc tạo trường started_at trong plist trước
+# 2. Đọc hoặc tạo trường started_at trong plist
 PLIST_CONTENT=$(plutil -p "$PLIST" 2>/dev/null)
 
 if [[ "$PLIST_CONTENT" =~ \"started_at\"[[:space:]]*\=\>[[:space:]]*\"(202[0-9])-([0-9]{2})-([0-9]{2}) ]]; then
@@ -100,21 +95,16 @@ MAC_DATE="${MM}${DD}0000${YYYY}"
 # 3. Chốt mốc thời gian thực (SAVED_EPOCH) trước khi lùi giờ
 NET_NOW=$(fetch_network_epoch)
 if [[ -n "$NET_NOW" ]]; then
-  # Có mạng: lấy giờ mạng và cập nhật luôn cho hệ thống
   SAVED_EPOCH="$NET_NOW"
   date "$(date -r "$SAVED_EPOCH" "+%m%d%H%M%Y.%S")" >/dev/null 2>&1
 elif [[ "$(date +%Y%m%d)" != "$FAKE_YMD" ]]; then
-  # Không có mạng nhưng đồng hồ máy đang ở ngày thực (không phải ngày fake): lấy trực tiếp từ đồng hồ máy
   SAVED_EPOCH=$(date +%s)
 elif [[ -f "$EPOCH_CACHE" ]]; then
-  # Không có mạng và máy đang bị kẹt ở ngày fake từ lần trước: khôi phục từ file cache
   SAVED_EPOCH=$(cat "$EPOCH_CACHE" 2>/dev/null)
 else
-  # Fallback cuối cùng khi offline hoàn toàn: lấy timestamp mới nhất của file log hệ thống
   SAVED_EPOCH=$(stat -f "%m" /var/log/system.log 2>/dev/null || date +%s)
 fi
 
-# Lưu mốc giờ thực xuống đĩa và bắt đầu đếm giây bằng biến nội bộ SECONDS của Bash
 echo "$SAVED_EPOCH" > "$EPOCH_CACHE"
 SECONDS=0
 
@@ -126,8 +116,8 @@ if pgrep -f "Parallels Desktop|prl_client_app|prl_vm_app" >/dev/null; then
   sleep 1
 fi
 
-# 5. Tắt NTP và lùi giờ hệ thống về ngày started_at
-echo "Setting date to ${YYYY}-${MM}-${DD} ($MAC_DATE)..."
+# 5. Tắt NTP và lùi giờ hệ thống về ngày started_at để khởi động Parallels
+echo "Setting macOS date to ${YYYY}-${MM}-${DD} ($MAC_DATE)..."
 systemsetup -setusingnetworktime off >/dev/null 2>&1
 date "$MAC_DATE" >/dev/null
 
@@ -146,7 +136,6 @@ VM=$(as_user prlctl list -a --no-header -o name | head -n 1 | sed 's/^[[:space:]
 [[ -z "$VM" ]] && { echo "No VM found."; restore_time; exit 1; }
 
 echo "Selected VM: $VM"
-as_user prlctl set "$VM" --time-sync off >/dev/null 2>&1
 
 # 8. Chờ nếu VM đang ở trạng thái chuyển tiếp (suspending/stopping)
 for (( i=0; i<15; i++ )); do
@@ -156,6 +145,9 @@ for (( i=0; i<15; i++ )); do
   sleep 2
 done
 
+# Tắt time-sync trong lúc giờ macOS đang bị lùi (nếu VM đang stopped)
+[[ "$VM_STATUS" == "stopped" ]] && as_user prlctl set "$VM" --time-sync off >/dev/null 2>&1
+
 # Khởi động hoặc Resume VM
 case "$VM_STATUS" in
   suspended|paused) as_user prlctl resume "$VM" ;;
@@ -163,6 +155,17 @@ case "$VM_STATUS" in
   *)                as_user prlctl start "$VM" 2>/dev/null || as_user prlctl resume "$VM" ;;
 esac
 
-# 9. Khôi phục giờ thực tế cho macOS và kết thúc
+# 9. Khôi phục giờ thực tế cho macOS ngay lập tức
 restore_time
-echo "Done! VM '$VM' is running and macOS time is restored."
+
+# 10. ĐỒNG BỘ LẠI GIỜ THỰC TỪ MACOS SANG WINDOWS VM
+echo "Syncing real time into Windows VM..."
+# Bật lại time-sync sau khi macOS đã về đúng giờ thực để Parallels Tools tự đẩy giờ chuẩn vào Windows
+as_user prlctl set "$VM" --time-sync on >/dev/null 2>&1
+
+# Gửi thêm lệnh ép Windows cập nhật đúng ngày giờ hiện tại của máy Mac (hoạt động cả khi Offline)
+WIN_DATE=$(date +"%m-%d-%Y")
+WIN_TIME=$(date +"%H:%M:%S")
+as_user prlctl exec "$VM" cmd.exe /c "date $WIN_DATE & time $WIN_TIME & net start w32time & w32tm /resync /force" >/dev/null 2>&1 &
+
+echo "Done! Both macOS and VM '$VM' are running with real-time clock."
