@@ -1,5 +1,29 @@
 #!/bin/bash
 
+# Tùy chọn dòng lệnh:
+#   (không tham số) : Khởi động/Resume thẳng VM (nhanh nhất)
+#   -r [số]         : Revert về snapshot mới nhất (hoặc số thứ tự chỉ định, vd: pd-clean -r 1)
+#   -s              : Hiện bảng danh sách chi tiết để chọn snapshot
+MODE="none"
+SNAP_ARG=""
+
+case "$1" in
+  -r|--revert)
+    MODE="latest"
+    [[ "$2" =~ ^[0-9]+$ ]] && { MODE="index"; SNAP_ARG="$2"; }
+    ;;
+  -s|--select)
+    MODE="select"
+    ;;
+  -h|--help)
+    echo "Usage: $(basename "$0") [-r [num] | -s]"
+    echo "  (no args) : Start/Resume VM directly"
+    echo "  -r [num]  : Revert to latest snapshot (or snapshot #num)"
+    echo "  -s        : Select snapshot interactively"
+    exit 0
+    ;;
+esac
+
 # 1. Tự nâng quyền root 1 lần duy nhất và xóa cache sudo cũ
 if (( EUID != 0 )); then
   clear
@@ -19,7 +43,7 @@ as_user() {
 
 [[ -d "/Applications/Parallels Desktop.app" ]] || { echo "Parallels not installed."; exit 1; }
 
-# Lấy Unix Timestamp qua HTTP Header bằng curl + BSD date thuần (nhanh, không cần Python)
+# Lấy Unix Timestamp qua HTTP Header bằng curl + BSD date thuần
 fetch_network_epoch() {
   local hdr ts
   for url in "http://captive.apple.com" "https://1.1.1.1" "https://www.google.com"; do
@@ -78,7 +102,7 @@ fi
 FAKE_YMD="${YYYY}${MM}${DD}"
 MAC_DATE="${MM}${DD}0000${YYYY}"
 
-# 3. Lưu mốc thời gian thực trước khi lùi giờ
+# 3. Chốt mốc thời gian thực trước khi lùi giờ
 if NET_NOW=$(fetch_network_epoch); then
   SAVED_EPOCH=$NET_NOW
   date "$(date -r "$SAVED_EPOCH" "+%m%d%H%M%Y.%S")" >/dev/null 2>&1
@@ -109,43 +133,139 @@ date "$MAC_DATE" >/dev/null
 echo "Starting Parallels Desktop..."
 as_user open -a "Parallels Desktop"
 
+# 6. Chờ dịch vụ sẵn sàng và lấy luôn UUID + Status + Name trong 1 lần gọi
+VM_UUID=""
 for (( i=0; i<30; i++ )); do
-  pgrep -f prl_client_app >/dev/null && as_user prlctl list -a >/dev/null 2>&1 && break
+  if pgrep -f prl_client_app >/dev/null; then
+    VM_LINE=$(as_user prlctl list -a --no-header -o uuid,status,name 2>/dev/null | head -n 1)
+    if [[ "$VM_LINE" =~ ^(\{[0-9a-fA-F-]+\})[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]]; then
+      VM_UUID="${BASH_REMATCH[1]}"
+      VM_STATUS="${BASH_REMATCH[2]}"
+      VM_NAME="${BASH_REMATCH[3]}"
+      break
+    fi
+  fi
   sleep 1
 done
 
-# 6. Tìm VM và kiểm tra trạng thái
-VM=$(as_user prlctl list -a --no-header -o name | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-[[ -z "$VM" ]] && VM=$(as_user prlctl list -a --no-header -o uuid | head -n 1 | tr -d '[:space:]')
-[[ -z "$VM" ]] && { echo "No VM found."; restore_time; exit 1; }
-
-echo "Selected VM: $VM"
+[[ -z "$VM_UUID" ]] && { echo "No VM found or service timeout."; restore_time; exit 1; }
+echo "Selected VM: $VM_NAME ($VM_UUID)"
 
 for (( i=0; i<15; i++ )); do
-  VM_STATUS=$(as_user prlctl list -a --no-header -o status "$VM" 2>/dev/null | awk '{print $1}')
-  [[ "$VM_STATUS" =~ ^(suspending|stopping)$ ]] || break
-  echo "Waiting for VM transition ($VM_STATUS)..."
+  [[ "$VM_STATUS" =~ ^(suspending|stopping|snapshotting)$ ]] || break
+  echo "Waiting for VM state ($VM_STATUS)..."
   sleep 2
+  VM_STATUS=$(as_user prlctl list --no-header -o status "$VM_UUID" 2>/dev/null | tr -d '[:space:]')
 done
 
-[[ "$VM_STATUS" == "stopped" ]] && as_user prlctl set "$VM" --time-sync off >/dev/null 2>&1
+# 7. Xử lý Snapshot bằng cách đọc trực tiếp Snapshots.xml + prlctl snapshot-list
+if [[ "$MODE" != "none" ]]; then
+  VM_HOME=$(as_user prlctl list -i "$VM_UUID" 2>/dev/null | awk -F': ' '/^Home:/ {print $2; exit}')
+  SNAP_XML="${VM_HOME%/}/Snapshots.xml"
+  RAW_SNAP=$(as_user prlctl snapshot-list "$VM_UUID" 2>/dev/null)
+  ACTIVE_SNAP=$(echo "$RAW_SNAP" | grep -oE '\*\{[0-9a-fA-F-]{36}\}' | tr -d '*')
+
+  SNAP_IDS=()
+  SNAP_LINES=()
+
+  if [[ -f "$SNAP_XML" ]]; then
+    while IFS='|' read -r sid scur sdate sstate sname sdesc; do
+      [[ -z "$sid" ]] && continue
+      SNAP_IDS+=("$sid")
+      SNAP_LINES+=("$(printf "%-3s | %-24s | %-19s | %-9s | %s %s" "$scur" "$sname" "$sdate" "$sstate" "$sid" "${sdesc:+($sdesc)}")")
+    done < <(python3 -c '
+import xml.etree.ElementTree as ET, sys
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+    cur = (sys.argv[2] or root.attrib.get("CurrentSnapshot", "")).lower()
+    for item in root.iter("SavedStateItem"):
+        guid = item.attrib.get("guid", "")
+        if not guid: continue
+        name = (item.findtext("Name") or "Unnamed").strip()
+        dt   = (item.findtext("DateTime") or "N/A").strip()
+        st   = (item.findtext("VmState") or item.findtext("State") or item.attrib.get("state") or "saved").strip()
+        desc = (item.findtext("Description") or "").strip().replace("\n", " ")
+        mark = " * " if guid.lower() == cur else "   "
+        print(f"{guid}|{mark}|{dt}|{st}|{name}|{desc}")
+except Exception:
+    pass
+' "$SNAP_XML" "$ACTIVE_SNAP" 2>/dev/null)
+  fi
+
+  # Fallback nếu Snapshots.xml không đọc được thì lấy trực tiếp danh sách UUID từ prlctl snapshot-list
+  if (( ${#SNAP_IDS[@]} == 0 )); then
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      SNAP_IDS+=("$id")
+      mark="   "
+      [[ "$(echo "$id" | tr '[:upper:]' '[:lower:]')" == "$(echo "$ACTIVE_SNAP" | tr '[:upper:]' '[:lower:]')" ]] && mark=" * "
+      SNAP_LINES+=("$(printf "%-3s | %-24s | %-19s | %-9s | %s" "$mark" "Snapshot" "N/A" "saved" "$id")")
+    done < <(echo "$RAW_SNAP" | grep -oE '\{[0-9a-fA-F-]{36}\}')
+  fi
+
+  if (( ${#SNAP_IDS[@]} == 0 )); then
+    echo "No snapshots found. Continuing normal startup..."
+  else
+    LATEST_IDX=$(( ${#SNAP_IDS[@]} - 1 ))
+    TARGET_SNAP=""
+
+    case "$MODE" in
+      latest)
+        TARGET_SNAP="${SNAP_IDS[$LATEST_IDX]}"
+        ;;
+      index)
+        if (( SNAP_ARG > 0 && SNAP_ARG <= ${#SNAP_IDS[@]} )); then
+          TARGET_SNAP="${SNAP_IDS[$((SNAP_ARG-1))]}"
+        else
+          echo "Invalid snapshot #$SNAP_ARG (Valid: 1-${#SNAP_IDS[@]})."
+          restore_time; exit 1
+        fi
+        ;;
+      select)
+        echo ""
+        echo "===================================================================================================="
+        printf " %-4s | %-3s | %-24s | %-19s | %-9s | %s\n" "No." "Cur" "Snapshot Name" "Created Date" "State" "Snapshot UUID / Description"
+        echo "----------------------------------------------------------------------------------------------------"
+        for idx in "${!SNAP_IDS[@]}"; do
+          printf " [%2d] | %s\n" "$((idx+1))" "${SNAP_LINES[$idx]}"
+        done
+        echo "===================================================================================================="
+        read -r -p "Select snapshot [1-${#SNAP_IDS[@]}] (Enter = latest #$((LATEST_IDX+1)), 0 = skip): " s_choice
+        if [[ -z "$s_choice" ]]; then
+          TARGET_SNAP="${SNAP_IDS[$LATEST_IDX]}"
+        elif [[ "$s_choice" =~ ^[0-9]+$ ]] && (( s_choice > 0 && s_choice <= ${#SNAP_IDS[@]} )); then
+          TARGET_SNAP="${SNAP_IDS[$((s_choice-1))]}"
+        fi
+        ;;
+    esac
+
+    if [[ -n "$TARGET_SNAP" ]]; then
+      echo "Reverting to snapshot $TARGET_SNAP..."
+      as_user prlctl snapshot-switch "$VM_UUID" --id "$TARGET_SNAP"
+      VM_STATUS=$(as_user prlctl list --no-header -o status "$VM_UUID" 2>/dev/null | tr -d '[:space:]')
+    fi
+  fi
+fi
+
+# 8. Khởi động hoặc Resume VM
+[[ "$VM_STATUS" == "stopped" ]] && as_user prlctl set "$VM_UUID" --time-sync off >/dev/null 2>&1
 
 case "$VM_STATUS" in
-  suspended|paused) as_user prlctl resume "$VM" ;;
   running)          echo "VM is already running." ;;
-  *)                as_user prlctl start "$VM" 2>/dev/null || as_user prlctl resume "$VM" ;;
+  suspended|paused) as_user prlctl resume "$VM_UUID" ;;
+  *)                as_user prlctl start "$VM_UUID" 2>/dev/null || as_user prlctl resume "$VM_UUID" ;;
 esac
 
-# 7. Khôi phục giờ thực tế cho macOS ngay lập tức
+# 9. Khôi phục giờ thực tế cho macOS ngay lập tức
 restore_time
 
-# 8. Đồng bộ giờ thực sang Windows VM (chạy ngầm để thoát script ngay)
+# 10. Đồng bộ giờ thực sang Windows VM (tự tính bù độ trễ cho mỗi vòng lặp chờ)
 echo "Syncing real time into Windows VM..."
-ISO_NOW=$(date +"%Y-%m-%dT%H:%M:%S")
 (
-  as_user prlctl set "$VM" --time-sync on >/dev/null 2>&1
-  for (( i=0; i<10; i++ )); do
-    if as_user prlctl exec "$VM" powershell.exe -NoProfile -WindowStyle Hidden -Command \
+  as_user prlctl set "$VM_UUID" --time-sync on >/dev/null 2>&1
+  for (( i=0; i<12; i++ )); do
+    ISO_NOW=$(date +"%Y-%m-%dT%H:%M:%S")
+    if as_user prlctl exec "$VM_UUID" powershell.exe -NoProfile -WindowStyle Hidden -Command \
       "Set-Date -Date '$ISO_NOW'; Start-Service w32time -ErrorAction SilentlyContinue; w32tm /resync /force" >/dev/null 2>&1; then
       break
     fi
@@ -153,4 +273,4 @@ ISO_NOW=$(date +"%Y-%m-%dT%H:%M:%S")
   done
 ) &
 
-echo "Done! Both macOS and VM '$VM' are synced to real time."
+echo "Done! Both macOS and VM '$VM_NAME' are synced to real time."
