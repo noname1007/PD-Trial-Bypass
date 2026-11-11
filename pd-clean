@@ -1,156 +1,126 @@
 #!/bin/bash
 
-clear
-
-echo "All rights reserved."
-
-if [ "$EUID" -eq 0 ]; then
-  echo "Do NOT run this script as root. Run normally."
-  exit 1
+# 1. Tự nâng quyền root 1 lần duy nhất và xóa cache timestamp sudo cũ
+if (( EUID != 0 )); then
+  clear
+  echo "Please enter your macOS password once:"
+  sudo -k
+  exec sudo "$0" "$@"
 fi
 
-if ! ls /Applications | grep -qi "Parallels Desktop"; then
-  echo "Parallels not installed. Exiting..."
-  exit 1
-fi
-
-echo "Parallels detected. Continuing..."
-
-echo "Please type your MacOS password!"
-sudo -v
-
-cleanup() {
-  echo ""
-  echo "CTRL+C detected. Cleaning up..."
-
-  echo "Please type your MacOS password AGAIN!"
-  sudo -v
-  
-  killall "Parallels Desktop" 2>/dev/null
-  sudo killall prl_client_app 2>/dev/null
-  sudo killall prl_vm_app 2>/dev/null
-
-  echo "Restoring network time..."
-  sudo systemsetup -setusingnetworktime on >/dev/null 2>&1
-  sudo sntp -sS time.apple.com >/dev/null 2>&1
-
-  echo "Done. Exiting."
-  exit 0
-}
-
-trap cleanup INT
-
-
-# Check if any Parallels processes are running
-if pgrep -f "Parallels Desktop" >/dev/null || \
-   pgrep -f prl_client_app >/dev/null || \
-   pgrep -f prl_vm_app >/dev/null; then
-
-  read -p "Parallels detected. FORCE kill processes? (y/n): " answer
-
-  case "$answer" in
-    y|Y)
-      echo "Killing Parallels..."
-      sudo killall "Parallels Desktop" prl_client_app prl_vm_app 2>/dev/null
-      ;;
-    n|N)
-      echo "Exit."
-      exit 0
-      ;;
-    *)
-      echo "Invalid input."
-      exit 1
-      ;;
-  esac
-
-else
-  echo "No Parallels processes running."
-fi
-
-echo "Disabling network time..."
-sudo systemsetup -setusingnetworktime off >/dev/null 2>&1
-
-# Correct user plist path (root)
+REAL_USER="${SUDO_USER:-$(stat -f '%Su' /dev/console)}"
+REAL_UID=$(id -u "$REAL_USER")
 PLIST="/var/root/Library/Preferences/com.parallels.desktop.plist"
 
-echo "Extracting started_at..."
+as_user() {
+  launchctl asuser "$REAL_UID" sudo -u "$REAL_USER" "$@"
+}
 
-STARTED_AT=$(sudo plutil -p $PLIST | tr ',' '\n' | grep '"started_at"' | head -1 | sed 's/.*"\(202[0-9-]*\)".*/\1/' | tr -d '-')
+[[ -d "/Applications/Parallels Desktop.app" ]] || { echo "Parallels not installed."; exit 1; }
 
-echo "Raw extracted date: $STARTED_AT"
+# Hàm đồng bộ lại giờ thực tế và dọn sạch sudo timestamp
+restore_time() {
+  systemsetup -setusingnetworktime on >/dev/null 2>&1
 
-if [[ -z "$STARTED_AT" ]]; then
-  echo "ERROR: Could not extract started_at"
-  exit 1
+  # Lấy Unix Timestamp thực qua HTTPS Header (bỏ qua lỗi chứng chỉ SSL khi lệch giờ)
+  local real_ts
+  real_ts=$(python3 -c '
+import urllib.request, email.utils, ssl
+ctx = ssl._create_unverified_context()
+for u in ("https://1.1.1.1", "https://www.apple.com", "https://www.google.com"):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(u, method="HEAD"), timeout=3, context=ctx) as r:
+            ts = int(email.utils.parsedate_to_datetime(r.headers["Date"]).timestamp())
+            if ts > 1760000000: print(ts); break
+    except: pass
+' 2>/dev/null)
+
+  if [[ -n "$real_ts" ]]; then
+    date "$(date -r "$real_ts" "+%m%d%H%M%Y.%S")" >/dev/null 2>&1
+  elif (( SAVED_EPOCH > 1760000000 )); then
+    date "$(date -r $(( SAVED_EPOCH + SECONDS )) "+%m%d%H%M%Y.%S")" >/dev/null 2>&1
+  fi
+
+  killall -9 timed 2>/dev/null
+  launchctl kickstart -k system/com.apple.timed 2>/dev/null
+  rm -rf /var/db/sudo/ts/* 2>/dev/null
+  echo "System time restored: $(date)"
+}
+
+trap 'echo ""; restore_time; exit 0' INT TERM
+
+# 2. Đảm bảo giờ hệ thống đang chuẩn trước khi lưu mốc thời gian gốc
+restore_time
+SAVED_EPOCH=$(date +%s)
+SECONDS=0
+
+# 3. Kiểm tra và đóng Parallels nếu đang chạy
+if pgrep -f "Parallels Desktop|prl_client_app|prl_vm_app" >/dev/null; then
+  read -r -p "Parallels is running. FORCE kill? (y/n): " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || exit 0
+  killall "Parallels Desktop" prl_client_app prl_vm_app 2>/dev/null
+  sleep 1
 fi
 
-# Convert YYYYMMDD → macOS format MMDD0000YYYY
-MM=${STARTED_AT:4:2}
-DD=${STARTED_AT:6:2}
-YYYY=${STARTED_AT:0:4}
+# 4. Đọc hoặc tự động tạo trường started_at bằng Bash Regex thuần
+PLIST_CONTENT=$(plutil -p "$PLIST" 2>/dev/null)
+
+if [[ "$PLIST_CONTENT" =~ \"started_at\"[[:space:]]*\=\>[[:space:]]*\"(202[0-9])-([0-9]{2})-([0-9]{2}) ]]; then
+  YYYY="${BASH_REMATCH[1]}"
+  MM="${BASH_REMATCH[2]}"
+  DD="${BASH_REMATCH[3]}"
+else
+  # Tìm ngày lịch sử trong plist hoặc dùng ngày mặc định
+  if [[ "$PLIST_CONTENT" =~ (202[0-9])-([0-9]{2})-([0-9]{2}) ]]; then
+    YYYY="${BASH_REMATCH[1]}"; MM="${BASH_REMATCH[2]}"; DD="${BASH_REMATCH[3]}"
+  else
+    YYYY="2026"; MM="11"; DD="10"
+  fi
+  DETECTED_DATE="${YYYY}-${MM}-${DD}"
+  echo "Injecting started_at: $DETECTED_DATE"
+  plutil -replace "started_at" -string "$DETECTED_DATE" "$PLIST" 2>/dev/null || \
+  plutil -insert "started_at" -string "$DETECTED_DATE" "$PLIST" 2>/dev/null
+fi
 
 MAC_DATE="${MM}${DD}0000${YYYY}"
 
-echo "Setting system date to $MAC_DATE ..."
-sudo date "$MAC_DATE"
+# 5. Tắt NTP và lùi giờ hệ thống
+echo "Setting date to ${YYYY}-${MM}-${DD} ($MAC_DATE)..."
+systemsetup -setusingnetworktime off >/dev/null 2>&1
+date "$MAC_DATE" >/dev/null
 
+# 6. Khởi động Parallels và chờ dịch vụ sẵn sàng
 echo "Starting Parallels Desktop..."
+as_user open -a "Parallels Desktop"
 
-open -a "Parallels Desktop" --args
-
-echo "Waiting for Parallels UI to start..."
-
-timeout=60  # seconds
-elapsed=0
-
-while ! pgrep -f prl_client_app >/dev/null; do
-  sleep 1
-  elapsed=$((elapsed + 1))
-
-  if [ "$elapsed" -ge "$timeout" ]; then
-    echo "Timeout waiting for Parallels UI"
-    exit 1
-  fi
+for (( i=0; i<30; i++ )); do
+  pgrep -f prl_client_app >/dev/null && as_user prlctl list -a >/dev/null 2>&1 && break
+  sleep 2
 done
 
-echo "Parallels UI detected. Continuing..."
-
-# Get first VM name (you can change selection logic if needed)
-VM=$(prlctl list -a -o name | tail -n +2 | head -n 1)
-
-if [ -z "$VM" ]; then
-  echo "No VM found"
-  exit 1
-fi
+# 7. Lấy thông tin VM đầu tiên
+VM=$(as_user prlctl list -a --no-header -o name | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+[[ -z "$VM" ]] && VM=$(as_user prlctl list -a --no-header -o uuid | head -n 1 | tr -d '[:space:]')
+[[ -z "$VM" ]] && { echo "No VM found."; restore_time; exit 1; }
 
 echo "Selected VM: $VM"
+as_user prlctl set "$VM" --time-sync off >/dev/null 2>&1
 
-# Disable time sync
-prlctl set "$VM" --time-sync off
-
-# Start VM
-prlctl start "$VM"
-
-echo "VM started: $VM"
-
-echo "Waiting for Parallels to close (Press Ctrl + C to FORCE)..."
-
-while true; do
-  if ! pgrep -f "Parallels Desktop" >/dev/null \
-    && ! pgrep -f prl_client_app >/dev/null \
-    && ! pgrep -f prl_vm_app >/dev/null; then
-
-    echo "Parallels not running. Restoring network time..."
-
-    echo "Please type your MacOS password AGAIN!"
-    sudo -v
-
-    sudo systemsetup -setusingnetworktime on >/dev/null 2>&1
-    sudo sntp -sS time.apple.com >/dev/null 2>&1
-
-    echo "Done."
-    exit 0
-  fi
-
-  sleep 15
+# 8. Chờ nếu VM đang kẹt ở trạng thái chuyển tiếp (suspending/stopping)
+for (( i=0; i<15; i++ )); do
+  VM_STATUS=$(as_user prlctl list -a --no-header -o status "$VM" 2>/dev/null | awk '{print $1}')
+  [[ "$VM_STATUS" =~ ^(suspending|stopping)$ ]] || break
+  echo "Waiting for VM state ($VM_STATUS)..."
+  sleep 2
 done
+
+# Khởi động hoặc Resume VM
+case "$VM_STATUS" in
+  suspended|paused) as_user prlctl resume "$VM" ;;
+  running)          echo "VM is already running." ;;
+  *)                as_user prlctl start "$VM" 2>/dev/null || as_user prlctl resume "$VM" ;;
+esac
+
+# 9. Khôi phục giờ thực tế cho macOS và kết thúc script ngay
+restore_time
+echo "Done! VM '$VM' is running and macOS time is synced."
