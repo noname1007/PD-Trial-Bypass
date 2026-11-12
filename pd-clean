@@ -3,7 +3,7 @@
 # PD-CLEAN: Parallels Desktop Time-Bypass, Launcher & Snapshot Manager (Optimized)
 # ==============================================================================
 
-VERSION="2.6.0"
+VERSION="2.7.1"
 PLIST="/var/root/Library/Preferences/com.parallels.desktop.plist"
 EPOCH_CACHE="/var/root/.pd_real_epoch"
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -28,10 +28,11 @@ ${Y}Options:${N}
   -s, --select         Show interactive snapshot table to select and revert
   -l, --list           List all snapshots without starting/modifying time
   -c, --create <name>  Create a new snapshot before starting
+  -x, --delete [num]   Delete snapshot interactively, by #<num>, or 'all' (and exit)
   -d, --date <date>    Set custom started_at date (format: YYYY-MM-DD) in plist
   -k, --kill           Force kill all running Parallels processes and exit
   -f, --fix-time       Force restore macOS real-time clock immediately and exit
-  -y, --yes            Skip confirmation prompt when killing running Parallels
+  -y, --yes            Skip confirmation prompts
   --install            Install globally to /usr/local/bin/pd-clean
   -h, --help           Show this help message
 EOF
@@ -43,6 +44,7 @@ EOF
 # 1. Root Escalation
 if (( EUID != 0 )); then
   echo "${C}=== PD-CLEAN v${VERSION} ===${N}"
+  sudo -k
   exec sudo "$SCRIPT_PATH" "$@"
 fi
 
@@ -61,6 +63,10 @@ while (( $# > 0 )); do
     -s|--select)   MODE="select" ;;
     -l|--list)     MODE="list_only" ;;
     -c|--create)   MODE="create"; SNAP_ARG="${2:-AutoSnap_$(date +%Y%m%d_%H%M)}"; shift ;;
+    -x|--delete|--rm)
+      MODE="delete"
+      if [[ -n "$2" && "$2" != -* ]]; then SNAP_ARG="$2"; shift; fi
+      ;;
     -d|--date)     CUSTOM_DATE="$2"; shift ;;
     -k|--kill)     MODE="kill_only" ;;
     -f|--fix-time) MODE="fix_time_only" ;;
@@ -84,7 +90,7 @@ as_user() {
 # 3. Global Install
 if [[ "$MODE" == "install" ]]; then
   mkdir -p /usr/local/bin
-  cp -f "$SCRIPT_PATH" /usr/local/bin/pd-clean
+  LC_ALL=C sed 's/\xc2\xa0/ /g' "$SCRIPT_PATH" > /usr/local/bin/pd-clean
   chmod 755 /usr/local/bin/pd-clean
   [[ -d "/opt/homebrew/bin" ]] && ln -sf /usr/local/bin/pd-clean /opt/homebrew/bin/pd-clean
   ok "Installed successfully to /usr/local/bin/pd-clean (v${VERSION})"
@@ -94,6 +100,9 @@ fi
 [[ -d "/Applications/Parallels Desktop.app" ]] || { err "Parallels Desktop not installed."; exit 1; }
 
 # 4. Fast Time Recovery (Online / Cache / Sudo Timestamp)
+SAVED_EPOCH=0
+RESTORE_PERFORMED=0
+
 fetch_network_epoch() {
   local hdr ts
   for url in "http://captive.apple.com" "https://1.1.1.1" "https://www.google.com"; do
@@ -106,7 +115,6 @@ fetch_network_epoch() {
   return 1
 }
 
-RESTORE_PERFORMED=0
 restore_time() {
   (( RESTORE_PERFORMED == 1 )) && return 0
   RESTORE_PERFORMED=1
@@ -132,8 +140,6 @@ restore_time() {
 
   ok "macOS time restored: $(date)"
 }
-
-trap 'restore_time' EXIT INT TERM
 
 # 5. Snapshot Engine (Native XML Parsing & Clean Output)
 load_snapshots() {
@@ -163,7 +169,7 @@ load_snapshots() {
 import xml.etree.ElementTree as ET, sys
 try:
     root = ET.parse(sys.argv[1]).getroot()
-    cur = (sys.argv[2] if len(sys.argv) > 2 else root.attrib.get("CurrentSnapshot", "")).lower()
+    cur = (sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else root.attrib.get("CurrentSnapshot", "")).lower()
     for item in root.iter("SavedStateItem"):
         guid = item.attrib.get("guid", "").strip()
         if not guid: continue
@@ -208,7 +214,7 @@ print_snapshot_table() {
   echo "=========================================================================================="
 }
 
-# 6. Utility Modes
+# 6. Utility Modes (-f, -k, -l)
 if [[ "$MODE" == "fix_time_only" ]]; then
   restore_time
   exit 0
@@ -230,9 +236,10 @@ if [[ "$MODE" == "list_only" ]]; then
   exit 0
 fi
 
-# 7. Plist Date Optimization (PlistBuddy / plutil extraction)
+# 7. Plist Date Optimization
 update_plist() {
   local target_val="$1"
+  [[ -f "$PLIST" ]] || plutil -create xml1 "$PLIST" 2>/dev/null
   plutil -replace "started_at" -string "$target_val" "$PLIST" 2>/dev/null || \
   plutil -insert "started_at" -string "$target_val" "$PLIST" 2>/dev/null
   killall cfprefsd 2>/dev/null
@@ -249,7 +256,12 @@ else
   if [[ "$EXISTING_DATE" =~ $DATE_REGEX ]]; then
     YYYY="${BASH_REMATCH[1]}"; MM="${BASH_REMATCH[2]}"; DD="${BASH_REMATCH[3]}"
   else
-    YYYY="2026"; MM="11"; DD="10"
+    PLIST_CONTENT=$(plutil -p "$PLIST" 2>/dev/null)
+    if [[ "$PLIST_CONTENT" =~ (202[0-9])-([0-9]{2})-([0-9]{2}) ]]; then
+      YYYY="${BASH_REMATCH[1]}"; MM="${BASH_REMATCH[2]}"; DD="${BASH_REMATCH[3]}"
+    else
+      YYYY="2026"; MM="11"; DD="10"
+    fi
     DETECTED_DATE="${YYYY}-${MM}-${DD}"
     info "Patching started_at ($DETECTED_DATE) into plist..."
     update_plist "$DETECTED_DATE"
@@ -259,7 +271,74 @@ fi
 FAKE_YMD="${YYYY}${MM}${DD}"
 MAC_DATE="${MM}${DD}0000${YYYY}"
 
-# 8. Save Host Epoch Before Spoofing
+# 8. Delete Snapshot Mode (-x / --delete)
+if [[ "$MODE" == "delete" ]]; then
+  VM_LINE=$(as_user prlctl list -a --no-header -o uuid,name 2>/dev/null | head -n 1)
+  VM_UUID=$(echo "$VM_LINE" | awk '{print $1}')
+  load_snapshots "$VM_UUID"
+  (( ${#SNAP_IDS[@]} == 0 )) && { warn "No snapshots found to delete."; exit 0; }
+
+  DEL_TARGETS=()
+
+  if [[ -z "$SNAP_ARG" ]]; then
+    print_snapshot_table
+    read -r -p "Enter snapshot number to DELETE [1-${#SNAP_IDS[@]}, 'all', or 0 to cancel]: " d_choice
+    [[ -z "$d_choice" || "$d_choice" == "0" ]] && { info "Canceled."; exit 0; }
+    SNAP_ARG="$d_choice"
+  fi
+
+  if [[ "$SNAP_ARG" == "all" ]]; then
+    if (( FORCE_KILL == 0 )); then
+      read -r -p "Are you sure you want to delete ALL ${#SNAP_IDS[@]} snapshot(s)? (y/N): " confirm
+      [[ "$confirm" =~ ^[Yy]$ ]] || { info "Canceled."; exit 0; }
+    fi
+    DEL_TARGETS=("${SNAP_IDS[@]}")
+  elif [[ "$SNAP_ARG" =~ ^[0-9]+$ ]] && (( SNAP_ARG > 0 && SNAP_ARG <= ${#SNAP_IDS[@]} )); then
+    DEL_TARGETS=("${SNAP_IDS[$((SNAP_ARG-1))]}")
+  else
+    err "Invalid snapshot selection: $SNAP_ARG (Valid: 1-${#SNAP_IDS[@]} or 'all')."
+    exit 1
+  fi
+
+  TIME_SPOOFED_FOR_DEL=0
+  if [[ -z "$VM_UUID" ]]; then
+    trap 'restore_time' EXIT INT TERM
+    SAVED_EPOCH=$(fetch_network_epoch || date +%s)
+    SECONDS=0
+    systemsetup -setusingnetworktime off >/dev/null 2>&1
+    date "$MAC_DATE" >/dev/null
+    TIME_SPOOFED_FOR_DEL=1
+    as_user open -a "Parallels Desktop"
+    for (( i=0; i<20; i++ )); do
+      VM_UUID=$(as_user prlctl list -a --no-header -o uuid 2>/dev/null | head -n 1 | tr -d '[:space:]')
+      [[ -n "$VM_UUID" ]] && break
+      sleep 0.5
+    done
+  fi
+
+  for del_id in "${DEL_TARGETS[@]}"; do
+    info "Deleting snapshot $del_id..."
+    if ! as_user prlctl snapshot-delete "$VM_UUID" --id "$del_id" 2>/dev/null; then
+      if (( TIME_SPOOFED_FOR_DEL == 0 )); then
+        trap 'restore_time' EXIT INT TERM
+        SAVED_EPOCH=$(fetch_network_epoch || date +%s)
+        SECONDS=0
+        systemsetup -setusingnetworktime off >/dev/null 2>&1
+        date "$MAC_DATE" >/dev/null
+        TIME_SPOOFED_FOR_DEL=1
+      fi
+      as_user prlctl snapshot-delete "$VM_UUID" --id "$del_id"
+    fi
+  done
+
+  (( TIME_SPOOFED_FOR_DEL == 1 )) && restore_time
+  ok "Snapshot deletion completed."
+  exit 0
+fi
+
+trap 'restore_time' EXIT INT TERM
+
+# 9. Save Host Epoch Before Spoofing
 if NET_NOW=$(fetch_network_epoch); then
   SAVED_EPOCH=$NET_NOW
 elif [[ "$(date +%Y%m%d)" != "$FAKE_YMD" ]]; then
@@ -273,11 +352,11 @@ fi
 echo "$SAVED_EPOCH" > "$EPOCH_CACHE"
 SECONDS=0
 
-# 9. Clean Running Instances
+# 10. Clean Running Instances
 if pgrep -f "Parallels Desktop|prl_client_app|prl_vm_app" >/dev/null; then
   if (( FORCE_KILL == 0 )); then
     read -r -p "Parallels is currently running. Force restart it? (y/n): " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || exit 0
+    [[ "$ans" =~ ^[Yy]$ ]] || { RESTORE_PERFORMED=1; exit 0; }
   fi
   info "Stopping running Parallels processes..."
   if [[ "$MODE" =~ ^(latest|index|select)$ ]]; then
@@ -288,7 +367,7 @@ if pgrep -f "Parallels Desktop|prl_client_app|prl_vm_app" >/dev/null; then
   sleep 0.5
 fi
 
-# 10. Clock Spoof & Launch
+# 11. Clock Spoof & Launch
 info "Bypassing clock -> ${YYYY}-${MM}-${DD}..."
 systemsetup -setusingnetworktime off >/dev/null 2>&1
 date "$MAC_DATE" >/dev/null
@@ -309,7 +388,7 @@ for (( i=0; i<40; i++ )); do
   sleep 0.5
 done
 
-[[ -z "$VM_UUID" ]] && { err "No VM found or dispatcher timeout."; restore_time; exit 1; }
+[[ -z "$VM_UUID" ]] && { err "No VM found or dispatcher timeout."; exit 1; }
 ok "Target VM: $VM_NAME ($VM_UUID) [State: $VM_STATUS]"
 
 # State transition guard
@@ -325,7 +404,7 @@ else
   done
 fi
 
-# 11. Snapshot Selection & Revert
+# 12. Snapshot Selection & Revert
 if [[ "$MODE" == "create" ]]; then
   info "Creating new snapshot '$SNAP_ARG'..."
   as_user prlctl snapshot "$VM_UUID" --name "$SNAP_ARG"
@@ -342,7 +421,7 @@ elif [[ "$MODE" != "none" ]]; then
           TARGET_SNAP="${SNAP_IDS[$((SNAP_ARG-1))]}"
         else
           err "Invalid snapshot #$SNAP_ARG (Valid: 1-${#SNAP_IDS[@]})."
-          restore_time; exit 1
+          exit 1
         fi
         ;;
       select)
@@ -359,12 +438,12 @@ elif [[ "$MODE" != "none" ]]; then
     if [[ -n "$TARGET_SNAP" ]]; then
       info "Reverting to snapshot $TARGET_SNAP..."
       as_user prlctl snapshot-switch "$VM_UUID" --id "$TARGET_SNAP"
-      sleep 0.5
+      sleep 0.8
     fi
   fi
 fi
 
-# 12. VM Ignition
+# 13. VM Ignition
 for (( attempt=1; attempt<=5; attempt++ )); do
   VM_STATUS=$(as_user prlctl list --no-header -o status "$VM_UUID" 2>/dev/null | tr -d '[:space:]')
   case "$VM_STATUS" in
@@ -382,10 +461,10 @@ for (( attempt=1; attempt<=5; attempt++ )); do
       as_user prlctl start "$VM_UUID" && break
       ;;
   esac
-  sleep 0.5
+  sleep 1
 done
 
-# 13. Immediate Host Recovery & Background Guest Clock Injection
+# 14. Immediate Host Recovery & Background Guest Clock Injection
 as_user open -a "Parallels Desktop" >/dev/null 2>&1
 restore_time
 
